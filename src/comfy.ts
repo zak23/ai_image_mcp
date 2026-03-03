@@ -87,29 +87,120 @@ function setNodeInput(workflow: WorkflowJson, nodeId: string, key: string, value
   node.inputs[key] = value;
 }
 
+type QueuePhase = "pending" | "running" | "not_found";
+
+type QueueInfo = {
+  phase: QueuePhase;
+  position: number | null; // 0-based position in pending queue, null if running/not_found
+};
+
 async function waitForImageOutput(
   baseUrl: string,
   promptId: string,
   timeoutMs: number,
   pollIntervalMs: number
 ): Promise<ComfyImageRef> {
-  const deadline = nowMs() + timeoutMs;
-  let lastHistory: Record<string, unknown> | undefined;
+  // Absolute hard cap to avoid infinite waits even if the job stays queued forever.
+  const absoluteDeadline = nowMs() + timeoutMs;
 
-  while (nowMs() < deadline) {
-    const historyById = await fetchJson<Record<string, unknown>>(`${baseUrl}/history/${promptId}`);
+  // How long we allow the job to be invisible in BOTH history and queue before
+  // giving up. This covers truly lost/errored jobs without penalising slow
+  // model loads or deep queues.
+  const notFoundGracePeriodMs = Math.min(120_000, timeoutMs);
+  let notFoundSince: number | null = null;
+
+  let lastHistory: Record<string, unknown> | undefined;
+  let lastQueueInfo: QueueInfo = { phase: "not_found", position: null };
+  let lastLoggedPhase: string | null = null;
+  let lastLoggedPosition: number | null = -1;
+
+  while (nowMs() < absoluteDeadline) {
+    // --- Check history (fast path: job already completed) ---
+    const historyById = await fetchJson<Record<string, unknown>>(`${baseUrl}/history/${promptId}`).catch(
+      () => ({}) as Record<string, unknown>
+    );
     lastHistory = historyById;
     const imageRef =
       extractImageFromHistory(historyById, promptId) ??
       extractImageFromHistoryDirect(historyById);
-    if (imageRef) {
-      return imageRef;
+    if (imageRef) return imageRef;
+
+    // --- Check queue ---
+    const queueInfo = await checkQueueStatus(baseUrl, promptId);
+    lastQueueInfo = queueInfo;
+
+    if (queueInfo.phase !== "not_found") {
+      // Job is visible — reset the not-found grace timer and log status changes.
+      notFoundSince = null;
+      const positionChanged = queueInfo.position !== lastLoggedPosition;
+      const phaseChanged = queueInfo.phase !== lastLoggedPhase;
+      if (phaseChanged || positionChanged) {
+        if (queueInfo.phase === "pending") {
+          console.error(
+            `[ai-image-mcp] prompt_id=${promptId} queued at position ${queueInfo.position} — waiting for earlier jobs to finish...`
+          );
+        } else {
+          console.error(`[ai-image-mcp] prompt_id=${promptId} running — generating image (model load may take a while on first run)...`);
+        }
+        lastLoggedPhase = queueInfo.phase;
+        lastLoggedPosition = queueInfo.position;
+      }
+    } else {
+      // Job not visible anywhere yet — start / maintain grace timer.
+      if (notFoundSince === null) notFoundSince = nowMs();
+      const notFoundMs = nowMs() - notFoundSince;
+      if (notFoundMs >= notFoundGracePeriodMs) {
+        const diag = summarizeHistoryForTimeout(lastHistory, promptId);
+        throw new Error(
+          `ComfyUI job prompt_id=${promptId} disappeared from both queue and history after ${Math.round(notFoundMs / 1000)}s. ${diag}`
+        );
+      }
     }
+
     await sleep(pollIntervalMs);
   }
 
+  const elapsed = Math.round((nowMs() - (absoluteDeadline - timeoutMs)) / 1000);
   const diag = summarizeHistoryForTimeout(lastHistory, promptId);
-  throw new Error(`Timed out waiting for ComfyUI output for prompt_id=${promptId}. ${diag}`);
+  const queueDiag =
+    lastQueueInfo.phase !== "not_found"
+      ? ` Job was still ${lastQueueInfo.phase}${lastQueueInfo.position !== null ? ` at position ${lastQueueInfo.position}` : ""} when timeout fired — consider increasing AI_IMAGE_TIMEOUT_MS.`
+      : "";
+  throw new Error(
+    `Timed out after ${elapsed}s waiting for ComfyUI output for prompt_id=${promptId}.${queueDiag} ${diag}`
+  );
+}
+
+async function checkQueueStatus(baseUrl: string, promptId: string): Promise<QueueInfo> {
+  type QueueResponse = {
+    queue_running: unknown[][];
+    queue_pending: unknown[][];
+  };
+
+  let queue: QueueResponse;
+  try {
+    queue = await fetchJson<QueueResponse>(`${baseUrl}/queue`);
+  } catch {
+    return { phase: "not_found", position: null };
+  }
+
+  // queue_running entries: [number, promptId, ...]
+  for (const entry of queue.queue_running ?? []) {
+    if (Array.isArray(entry) && entry[1] === promptId) {
+      return { phase: "running", position: null };
+    }
+  }
+
+  // queue_pending entries: [number, promptId, ...] ordered front-to-back
+  const pending = queue.queue_pending ?? [];
+  for (let i = 0; i < pending.length; i++) {
+    const entry = pending[i];
+    if (Array.isArray(entry) && entry[1] === promptId) {
+      return { phase: "pending", position: i };
+    }
+  }
+
+  return { phase: "not_found", position: null };
 }
 
 function extractImageFromHistory(history: Record<string, unknown>, promptId: string): ComfyImageRef | null {

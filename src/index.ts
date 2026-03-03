@@ -16,9 +16,16 @@ loadDotEnvSync(path.join(repoRoot, ".env"));
 
 const config = {
   comfyBaseUrl: process.env.COMFYUI_BASE_URL ?? "http://127.0.0.1:8188",
-  workflowPath: path.resolve(process.env.COMFYUI_WORKFLOW_PATH ?? path.join(repoRoot, "image_z_image_turbo.json")),
-  outputDir: path.resolve(process.env.AI_IMAGE_OUTPUT_DIR ?? path.join(repoRoot, "assets/generated")),
-  timeoutMs: parseInt(process.env.AI_IMAGE_TIMEOUT_MS ?? "60000", 10),
+  workflowPath: (() => {
+    const raw = process.env.COMFYUI_WORKFLOW_PATH ?? "image_z_image_turbo.json";
+    return path.isAbsolute(raw) ? path.resolve(raw) : path.join(repoRoot, raw);
+  })(),
+  outputDir: (() => {
+    const raw = process.env.AI_IMAGE_OUTPUT_DIR;
+    if (!raw) return path.join(repoRoot, "assets/generated");
+    return path.isAbsolute(raw) ? raw : path.join(repoRoot, raw);
+  })(),
+  timeoutMs: parseInt(process.env.AI_IMAGE_TIMEOUT_MS ?? "600000", 10),
   pollIntervalMs: parseInt(process.env.AI_IMAGE_POLL_INTERVAL_MS ?? "800", 10),
   maxDimension: 1024,
   workspaceCwd: process.cwd(),
@@ -233,7 +240,14 @@ async function logStartupHealth(): Promise<void> {
     await fs.access(config.workflowPath);
     checks.workflowExists = true;
   } catch {
-    checks.workflowExists = false;
+    const fallback = path.join(repoRoot, path.basename(config.workflowPath));
+    try {
+      await fs.access(fallback);
+      (config as { workflowPath: string }).workflowPath = fallback;
+      checks.workflowExists = true;
+    } catch {
+      checks.workflowExists = false;
+    }
   }
 
   try {

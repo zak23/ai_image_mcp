@@ -5,7 +5,7 @@ MCP server that lets Cursor generate images through a self-hosted ComfyUI workfl
 It:
 - accepts a text prompt (+ optional size/seed/path args)
 - submits the prompt to ComfyUI via its REST API
-- polls until the job completes
+- polls both the queue **and** history, waiting through model loads, queued jobs, and cold starts
 - saves the image to disk
 - returns structured metadata and optional base64/image payloads
 
@@ -110,9 +110,9 @@ npm run smoke -- --prompt "minimal product photo of matte black headphones on a 
 |---|---|---|
 | `COMFYUI_BASE_URL` | `http://127.0.0.1:8188` | ComfyUI REST API base URL |
 | `COMFYUI_WORKFLOW_PATH` | `./image_z_image_turbo.json` | Path to workflow JSON (relative to repo root or absolute) |
-| `AI_IMAGE_OUTPUT_DIR` | `./assets/generated` | Where generated images are saved |
-| `AI_IMAGE_TIMEOUT_MS` | `60000` | Max ms to wait for a ComfyUI job to finish |
-| `AI_IMAGE_POLL_INTERVAL_MS` | `800` | How often to poll `/history` |
+| `AI_IMAGE_OUTPUT_DIR` | `./assets/generated` | Where generated images are saved (relative to repo root or absolute) |
+| `AI_IMAGE_TIMEOUT_MS` | `600000` | Absolute hard cap (ms) for a single generation. The server also applies a 120 s "not-found grace period" — if the job disappears from both queue and history for 120 s it fails early. Raise this value if you have a very deep queue. |
+| `AI_IMAGE_POLL_INTERVAL_MS` | `800` | How often to poll `/queue` and `/history` |
 | `AI_IMAGE_AUTO_COPY_TO_WORKSPACE` | `1` | Set `0` to disable auto-copy into caller workspace |
 | `AI_IMAGE_ALLOW_EXTERNAL_OUTPUT` | `1` | Set `0` to force `outputPath` inside repo only |
 
@@ -155,12 +155,19 @@ Cursor isn't loading your MCP config. Fully restart Cursor (not just reload wind
 **Tools don't appear in chat**
 Run `npm run build` and verify the `dist/index.js` path in your MCP config is correct.
 
-**Timeout: `history_keys=(none) output_nodes=0`**
-The job was submitted but never completed. Check:
+**Generation timed out**
+The server will log queue position and running state as it polls, e.g.:
+```
+[ai-image-mcp] prompt_id=… queued at position 2 — waiting for earlier jobs to finish...
+[ai-image-mcp] prompt_id=… running — generating image (model load may take a while on first run)...
+```
+If it times out anyway, check:
 - `COMFYUI_BASE_URL` points to the right machine
 - That machine has sufficient free VRAM/RAM to load the model
 - ComfyUI logs on the server side for errors
-- Try increasing `AI_IMAGE_TIMEOUT_MS` (e.g. `120000`) for slow cold-starts
+- Raise `AI_IMAGE_TIMEOUT_MS` (default `600000` = 10 min) if you have an unusually deep queue or a very large model
+
+The server uses a two-phase wait: it keeps polling as long as the job is visible in the ComfyUI queue (pending or running), and only applies the hard timeout. This means cold-start model loads and queued jobs behind other requests are handled automatically.
 
 **Unexpected output dimensions**
 Width/height are rounded to the nearest multiple of 64 and clamped to 1024 max.

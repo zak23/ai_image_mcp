@@ -62,11 +62,22 @@ async function main() {
   const { generateWithComfy } = await import("../dist/comfy.js");
   const { ensureDir, isPathInside, makeFilename, writeFile } = await import("../dist/util.js");
 
+  const resolveRelativeToRepo = (raw, fallback) => {
+    if (!raw) return fallback;
+    return path.isAbsolute(raw) ? raw : path.join(repoRoot, raw);
+  };
+
   const config = {
     comfyBaseUrl: process.env.COMFYUI_BASE_URL ?? "http://127.0.0.1:8188",
-    workflowPath: path.resolve(process.env.COMFYUI_WORKFLOW_PATH ?? path.join(repoRoot, "image_z_image_turbo.json")),
-    outputDir: path.resolve(process.env.AI_IMAGE_OUTPUT_DIR ?? path.join(repoRoot, "assets/generated")),
-    timeoutMs: parseInt(process.env.AI_IMAGE_TIMEOUT_MS ?? "60000", 10),
+    workflowPath: resolveRelativeToRepo(
+      process.env.COMFYUI_WORKFLOW_PATH,
+      path.join(repoRoot, "image_z_image_turbo.json")
+    ),
+    outputDir: resolveRelativeToRepo(
+      process.env.AI_IMAGE_OUTPUT_DIR,
+      path.join(repoRoot, "assets/generated")
+    ),
+    timeoutMs: parseInt(process.env.AI_IMAGE_TIMEOUT_MS ?? "600000", 10),
     pollIntervalMs: parseInt(process.env.AI_IMAGE_POLL_INTERVAL_MS ?? "800", 10),
     maxDimension: 1024
   };
